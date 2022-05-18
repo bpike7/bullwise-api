@@ -1,0 +1,44 @@
+{
+  "name": "bullwise-socket",
+  "version": "1.0.0",
+  "description": "Google sheets day trade hub",
+  "main": "index.js",
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "dev": ". env/local.env && NODE_ENV=development nodemon index.js",
+    "start": ". env/local.env && node index.js",
+    "deploy": "APP_NAME=bullwise-staging ./scripts/deploy.sh",
+    "logs:staging": "heroku logs -t --app=bullwise-staging",
+    "logs:production": "heroku logs -t --app=bullwise",
+    "update-daily-candles": "source ./env/local.env && node --require esm ./scripts/updateDailyCandles.js"
+  },
+  "author": "Brooks Pike",
+  "license": "ISC",
+  "dependencies": {
+    "@slack/web-api": "^5.14.0",
+    "async-redis": "^2.0.0",
+    "axios": "^0.21.4",
+    "big.js": "^6.1.1",
+    "cron": "^1.8.2",
+    "esm": "^3.2.25",
+    "express": "^4.17.1",
+    "express-async-handler": "^1.1.4",
+    "googleapis": "^84.0.0",
+    "https": "^1.0.0",
+    "moment-timezone": "^0.5.33",
+    "morgan": "^1.10.0",
+    "socket.io": "^4.5.0",
+    "socket.io-client": "^4.5.0",
+    "uninstall": "0.0.0",
+    "ws": "^8.2.1"
+  },
+  "devDependencies": {
+    "mocha": "^9.1.1",
+    "nodemon": "^2.0.6"
+  },
+  "engines": {
+    "node": "v12.16.1"
+  }
+}
