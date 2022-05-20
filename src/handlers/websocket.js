@@ -11,12 +11,19 @@ export default new class WS {
     server.listen(PORT_WS, function () {
       console.log(`Server is listening on ${PORT_WS}!`)
     });
+    this.wss.on("connection", ws => this.handleMessage(ws));
   }
   sendMessage(message) {
     this.wss.clients.forEach((client) => {
       if (client.readyState === WebSocket.OPEN) {
         client.send(message);
       }
+    });
+  }
+
+  handleMessage(ws) {
+    ws.on("message", data => {
+      console.log(`Client has sent us: ${data}`)
     });
   }
 }

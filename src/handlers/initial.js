@@ -1,8 +1,9 @@
-import { collectWatchlistData } from "../interface";
+import { collectData } from "../interface";
 import trading from '../trading.js';
 
-trading.createMarketStream();
-collectWatchlistData()
+trading.createAccountStream();
+
+collectData()
   .then(() => {
     console.log('Iniitial data collected')
   })

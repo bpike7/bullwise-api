@@ -1,0 +1,97 @@
+{
+  "local": {
+    "driver": "pg",
+    "database": {
+      "ENV": "DATABASE"
+    },
+    "host": {
+      "ENV": "PGHOST"
+    },
+    "port": {
+      "ENV": "PGPORT"
+    },
+    "user": {
+      "ENV": "PGUSER"
+    },
+    "password": {
+      "ENV": "PGPASSWORD"
+    },
+    "dialect": "postgres"
+  },
+  "development": {
+    "driver": "pg",
+    "database": {
+      "ENV": "DATABASE"
+    },
+    "host": {
+      "ENV": "PGHOST"
+    },
+    "port": {
+      "ENV": "PGPORT"
+    },
+    "user": {
+      "ENV": "PGUSER"
+    },
+    "password": {
+      "ENV": "PGPASSWORD"
+    },
+    "dialect": "postgres"
+  },
+  "test": {
+    "driver": "pg",
+    "database": {
+      "ENV": "DATABASE"
+    },
+    "host": {
+      "ENV": "PGHOST"
+    },
+    "port": {
+      "ENV": "PGPORT"
+    },
+    "user": {
+      "ENV": "PGUSER"
+    },
+    "password": {
+      "ENV": "PGPASSWORD"
+    },
+    "dialect": "postgres"
+  },
+  "sandbox": {
+    "driver": "pg",
+    "database": {
+      "ENV": "DATABASE"
+    },
+    "host": {
+      "ENV": "PGHOST"
+    },
+    "port": {
+      "ENV": "PGPORT"
+    },
+    "user": {
+      "ENV": "PGUSER"
+    },
+    "password": {
+      "ENV": "PGPASSWORD"
+    },
+    "dialect": "postgres"
+  },
+  "production": {
+    "driver": "pg",
+    "database": {
+      "ENV": "DATABASE"
+    },
+    "host": {
+      "ENV": "PGHOST"
+    },
+    "port": {
+      "ENV": "PGPORT"
+    },
+    "user": {
+      "ENV": "PGUSER"
+    },
+    "password": {
+      "ENV": "PGPASSWORD"
+    },
+    "dialect": "postgres"
+  }
+}

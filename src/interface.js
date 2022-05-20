@@ -4,86 +4,17 @@ import moment from 'moment-timezone';
 import { getSheetData, hubRangeMap } from './modules/googleSheets.js';
 import Big from 'big.js';
 import ws from './handlers/websocket.js';
+import sql from './modules/db.js';
+import { v4 as v4uuid } from 'uuid';
 
-const { NODE_ENV, APP_URL, PORT, SPREADSHEET_ID_HUB } = process.env;
+const { NODE_ENV, APP_URL, PORT, BULLWISE_SPREADSHEET_ID } = process.env;
 
 const quoteCache = {};
 let watchlist = [];
 
 const max = 500;
 
-export async function testWatchlistMonitor() {
-  watchlist[1].calls = [];
-  ws.sendMessage(JSON.stringify({
-    watchlist: watchlist.map(wl => ({
-      symbol: wl.symbol,
-      price_now: wl.price_now,
-      volume_relative: wl.volume_relative,
-      calls: wl.calls,
-      puts: wl.puts,
-      strike_diff: wl.strike_diff,
-      strike_max: [...wl.calls, ...wl.puts].reduce((acc, { strike }) => {
-        if (strike > acc) acc = strike
-        return acc;
-      }, 0),
-      strike_min: [...wl.calls, ...wl.puts].reduce((acc, { strike }) => {
-        if (strike < acc) acc = strike
-        return acc;
-      }, 100000),
-    }))
-  }));
-}
-
-export async function testOrderMessages({ status }) {
-  ws.sendMessage(JSON.stringify({
-    orders: [{
-      id: 11111,
-      symbol: 'NFLX',
-      status,
-      action: 'buy',
-      type: 'limit',
-      option_type: 'call',
-      strike: 180,
-      size: 2,
-      price_relative_favorable: .4
-    }]
-  }))
-}
-
-export async function getInitialData() {
-  const account = await trading.getAccount();
-  return {
-    watchlist: watchlist.map(w => ({
-      symbol: w.symbol,
-      price_now: w.price_now,
-      volume_relative: w.volume_relative,
-      calls: w.calls,
-      puts: w.puts,
-      strike_diff: w.strike_diff
-    })),
-    positions: (await trading.getPositions() || []),
-    orders: (await trading.getOrders() || []),
-    account: {
-      value: account.total_equity,
-      pl_close: account.close_pl
-    },
-    indices: (await trading.getAllQuotes(['QQQ', 'SPY', 'DIA'])).reduce((acc, { symbol, last, change_percentage, open, high, low, close }) => {
-      acc[symbol] = {
-        symbol,
-        price_now: last,
-        change_percentage,
-        open,
-        high,
-        low,
-        close
-      };
-      return acc;
-    }, {})
-  };
-}
-
-export async function collectWatchlistData() {
-  console.log('-Collecting');
+export async function collectData() {
   const account = await trading.getAccount();
   const symbols = await getSymbols();
   const quotes = await getQuotes(symbols);
@@ -91,8 +22,7 @@ export async function collectWatchlistData() {
   watchlist = quotes
     .sort((a, b) => a.volume_relative > b.volume_relative ? -1 : 1)
     .slice(0, 8);
-
-  ws.sendMessage(JSON.stringify({
+  const data = {
     watchlist: watchlist.map(wl => {
       const { strike_min, strike_max, strike_close } = [...wl.calls, ...wl.puts].reduce((acc, { strike }) => {
         if (strike > acc.strike_max) acc.strike_max = strike;
@@ -119,18 +49,26 @@ export async function collectWatchlistData() {
       pl_close: account.close_pl
     },
     indices: await getIndexLevelData()
-  }))
+  };
+  ws.sendMessage(JSON.stringify(data))
   console.log('-end');
+  return data;
 }
 
-const indexLevelKeys = ['open', 'prevclose', 'high', 'low', 'close'];
 export async function getIndexLevelData() {
-  (await trading.getAllQuotes(['QQQ', 'SPY', 'DIA'])).reduce((acc, q) => {
-    acc[q.symbol] = { above: [], below: [] };
-
-
-
-
+  return (await trading.getAllQuotes(['QQQ', 'SPY', 'DIA'])).reduce((acc, q) => {
+    acc[q.symbol] = {
+      price_now: q.last,
+      change_percentage: q.change_percentage,
+      change_percentage_open: percentGrowth(q.last, q.open),
+      above: [],
+      below: []
+    };
+    ['open', 'prevclose', 'high', 'low', 'close'].forEach(key => {
+      const percent_from = percentGrowth(q.last, q[key]);
+      if (percent_from >= 0) acc[q.symbol].above.push({ type: key, percent_from });
+      else acc[q.symbol].below.push({ type: key, percent_from });
+    });
     return acc;
   }, {});
 }
@@ -143,7 +81,6 @@ export async function pingHeartBeat() {
   await axios.get(`${APP_URL}${NODE_ENV === 'development' ? `:${PORT}` : ''}/heartbeat`);
 }
 
-// TODO - unfinished
 export async function createBuyOrder({ symbol, option_type, strike, size_relative, buy_sell_point }) {
   const cachedQuote = quoteCache[symbol];
   if (!cachedQuote) throw Error(`No cached quote found for ${symbol}`);
@@ -152,24 +89,41 @@ export async function createBuyOrder({ symbol, option_type, strike, size_relativ
   const option = cachedQuote[`${option_type}s`].find((o) => o.strike === strike);
   if (!option) throw Error(`No option found for strike ${option_type} ${strike}`);
 
-
-  // TODO - make below dynamic
   const costMax = 600;
-  const cost = buy_sell_point === 'bid-ask' ? option.ask : Big(option.ask).plus(option.bid).div(2).round(2).toNumber();
+  const side = 'buy_to_open';
+  const type = 'market';
+  const price = buy_sell_point === 'bid-ask' ? option.ask : Big(option.ask).plus(option.bid).div(2).toNumber();
+  const cost = Big(price).times(100).toNumber();
+  const quantity = Big(costMax).div(cost).round().toNumber();
 
-  const data = await trading.createOrder({
-    symbol,
-    option_symbol: option.symbol,
-    side: 'buy_to_order',
-    order_size: Big(costMax).div(cost).round().toNumber(),
-    order_type: option_type,
-    order_price: cost,
-  });
-  console.log(option);
+  try {
+    const [{ uuid }] = await sql`
+      insert into orders 
+      (uuid, state, contract, strike, quantity, price, type, side) VALUES
+      (${v4uuid()}, 'accepted', ${option.symbol}, ${option.strike}, ${quantity}, ${price}, ${type}, ${side})
+      returning uuid
+    `;
+    const order = await trading.createOrder({
+      symbol,
+      option_symbol: option.symbol,
+      side,
+      quantity,
+      type,
+      tag: uuid
+    });
+    await sql`
+      update orders set 
+        tradier_id = ${order.id.toString()}, 
+        state='sent'
+      where uuid = ${uuid}`;
+    console.log('order state updated');
+  } catch (err) {
+    console.log(err);
+  }
 }
 
 async function getSymbols() {
-  return (await getSheetData(SPREADSHEET_ID_HUB, hubRangeMap.hub_input_watchlist)).map(([symbol]) => symbol);
+  return (await getSheetData(BULLWISE_SPREADSHEET_ID, hubRangeMap.hub_input_watchlist)).map(([symbol]) => symbol);
 }
 
 async function getQuotes(symbols) {

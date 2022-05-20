@@ -1,34 +1,49 @@
 import axios from 'axios';
 import WSClient from './handlers/websocket.js';
 import moment from 'moment-timezone';
+import qs from 'qs';
+import sql from './modules/db.js';
 
 const {
-  NODE_ENV,
-  TRADIER_BASE_URL_SANDBOX,
   TRADIER_BASE_URL,
   TRADIER_ACCESS_TOKEN,
-  TRADIER_ACCESS_TOKEN_SANDBOX,
   TRADIER_ACCOUNT_ID,
-  TRADIER_ACCOUNT_ID_SANDBOX
+  TRADIER_WS_BASE_URL,
+
+  TRADIER_BASE_URL_PRODUCTION,
+  TRADIER_ACCESS_TOKEN_PRODUCTION
 } = process.env;
+
 const WebSocket = require('ws');
 
 
 export default new class Tradier {
   constructor() {
     this._requestor_production = axios.create({
+      baseURL: TRADIER_BASE_URL_PRODUCTION,
+      headers: {
+        Authorization: `Bearer ${TRADIER_ACCESS_TOKEN_PRODUCTION}`,
+        Accept: 'application/json'
+      }
+    });
+    this._requestor = axios.create({
       baseURL: TRADIER_BASE_URL,
-      headers: { Authorization: `Bearer ${TRADIER_ACCESS_TOKEN}` },
-      Accept: 'application/json'
+      headers: {
+        Authorization: `Bearer ${TRADIER_ACCESS_TOKEN}`,
+        Accept: 'application/json'
+      }
     });
-    this._requestor_default = NODE_ENV === 'production' ? this._requestor_production : axios.create({
-      baseURL: TRADIER_BASE_URL_SANDBOX,
-      headers: { Authorization: `Bearer ${TRADIER_ACCESS_TOKEN_SANDBOX}` },
-      Accept: 'application/json'
+    this._requestor_qs = axios.create({
+      baseURL: TRADIER_BASE_URL,
+      headers: {
+        Authorization: `Bearer ${TRADIER_ACCESS_TOKEN}`,
+        'Accept': 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded'
+      }
     });
-    this._account_id_production = TRADIER_ACCOUNT_ID;
-    this._account_id_default = NODE_ENV === 'production' ? this._account_id_production : TRADIER_ACCOUNT_ID_SANDBOX;
   }
+
+  // Market Data
 
   async getAllQuotes(symbols) {
     try {
@@ -65,10 +80,11 @@ export default new class Tradier {
     }
   }
 
+  // Account Data
+
   async getAccount() {
     try {
-      return {} // TODO
-      const { data } = await this._requestor_default.get(`/v1/accounts/${TRADIER_ACCOUNT_ID}/balances`);
+      const { data } = await this._requestor.get(`/v1/accounts/${TRADIER_ACCOUNT_ID}/balances`);
       return data.balances;
     } catch (err) {
       console.log('Err: getAccount');
@@ -78,76 +94,86 @@ export default new class Tradier {
 
   async getPositions() {
     try {
-      return [] // TODO
-      const { data } = await this._requestor_default.get(`v1/accounts/${TRADIER_ACCOUNT_ID}/positions`);
+      const { data } = await this._requestor.get(`v1/accounts/${TRADIER_ACCOUNT_ID}/positions`);
+      if (data.positions === 'null') return [];
+      if (data.positions.position instanceof Object) return [data.positions.position];
       return data.positions.position;
     } catch (err) {
       console.log('Err: getPositions');
       console.log(err);
     }
-  }
+  };
 
   async getOrders() {
     try {
-      return [] // TODO
-      const { data } = await this._requestor_default.get(`v1/accounts/${TRADIER_ACCOUNT_ID}/orders`);
-      return data.orders.order;
+      const { data } = await this._requestor.get(`v1/accounts/${TRADIER_ACCOUNT_ID}/orders`);
+      if (data.orders === 'null') return [];
+      return data.orders.order.filter(({ status }) => ['open', 'partially_filled', 'pending'].includes(status));
     } catch (err) {
       console.log('Err: getOrders');
       console.log(err);
     }
   }
 
+  // Orders
+
   async createOrder({
+    tag,
     symbol,
     option_symbol,
-    order_size,
-    order_type,
+    quantity,
+    type,
     order_price,
     side
   }) {
     try {
-      const { data } = await axios.post(`v1/accounts/${TRADIER_ACCOUNT_ID}/orders`, {
-        account_id: TRADIER_ACCOUNT_ID,
+      const { data } = await this._requestor_qs.post(`/v1/accounts/${TRADIER_ACCOUNT_ID}/orders`, qs.stringify({
+        tag,
         class: 'option',
         symbol,
         option_symbol,
         side,
-        quantity: order_size.toString(),
-        type: order_type,
+        quantity: quantity.toString(),
+        type,
         duration: 'gtc',
-        price: order_type === 'limit' ? order_price : undefined,
-        stop: order_type === 'stop' ? order_price : undefined
-      });
-      return data.orders.order;
+        price: order_price
+      }));
+      if (!data.order || data.order.status !== 'ok') console.log('order status not ok!: ', data);
+      return data.order;
     } catch (err) {
-      console.log('Err: createOrder');
       console.log(err);
     }
   }
 
+  async cancelOrder({ }) {
+
+  }
+
   async createAccountStream() {
     try {
-
-      const { data } = await this._requestor_default.post('/v1/accounts/events/session');
-      const ws = new WebSocket('wss://ws.tradier.com/v1/accounts/events');
+      const { data } = await this._requestor.post('/v1/accounts/events/session');
+      const ws = new WebSocket(`${TRADIER_WS_BASE_URL}/v1/accounts/events`);
       ws.on('open', function open() {
         ws.send(JSON.stringify({
           sessionid: data.stream.sessionid,
           events: ['order']
         }));
       });
-      ws.on('message', function (data) {
-        if (data.event !== 'order') return console.log(`Not order event: ${JSON.stringify(data)}`);
-        WSClient.sendMessage(JSON.stringify({
-          id: data.id,
-          status: data.status,
-          price: data.price,
-          stop_price: data.stop_price,
-          avg_fill_price: data.avg_fill_price,
-          executed_quantity: data.executed_quantity,
-          remaining_quantity: data.remaining_quantity
-        }));
+      ws.on('message', function (dataRaw) {
+        const data = JSON.parse(dataRaw);
+        console.log('MESSAGE->>>>>>>>', data);
+        if (data.event === 'order') return handleOrderMessage(data);
+        return console.log(`Not order event: ${JSON.stringify(data)}`);
+
+        // WSClient.sendMessage(JSON.stringify({
+        //   id: data.id,
+        //   status: data.status,
+        //   price: data.price,
+        //   stop_price: data.stop_price,
+        //   avg_fill_price: data.avg_fill_price,
+        //   executed_quantity: data.executed_quantity,
+        //   remaining_quantity: data.remaining_quantity
+        // }));
       });
       ws.on('error', function (data) {
         console.log(data);
@@ -194,5 +220,54 @@ export default new class Tradier {
     //     console.log(err);
     //     console.log('Err: createMarketStream');
     //   }
+  }
+}
+
+async function handleOrderMessage(data) {
+  try {
+    const [existing] = await sql`select * from orders where uuid = ${data.tag}`;
+    if (!existing) throw Error(`Unable to find order for ${data.id} ${data.tag}`);
+
+    handleNotifications(existing, data);
+
+    await sql`
+      update orders set
+      state = ${data.status},
+      price = ${data.avg_fill_price}
+      where uuid = ${data.tag}
+    `;
+  } catch (err) {
+    console.log('Failed to handle order message: ', data, err);
+  }
+}
+
+async function handleNotifications({ state: statePrev, contract, quantity }, { status: stateCurr, exec_quantity, remaining_quantity }) {
+  if (statePrev === stateCurr) return;
+
+  if (['partially_filled'].includes(stateCurr)) {
+    return WSClient.sendMessage(JSON.stringify({
+      notification: {
+        message: `Order partially filled: ${contract} (${exec_quantity}/${exec_quantity + remaining_quantity})`,
+        color: 'white'
+      }
+    }));
+  }
+
+  if (!['pending', 'open'].includes(statePrev) && ['pending', 'open'].includes(stateCurr)) {
+    return WSClient.sendMessage(JSON.stringify({
+      notification: {
+        message: `Order placed: ${contract} x${quantity}`,
+        color: 'white'
+      }
+    }));
+  }
+
+  if (['filled'].includes(stateCurr)) {
+    WSClient.sendMessage(JSON.stringify({
+      notification: {
+        message: `Order filled!: ${contract} x${quantity}`,
+        color: 'green'
+      }
+    }));
   }
 }

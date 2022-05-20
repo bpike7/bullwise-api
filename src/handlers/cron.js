@@ -1,11 +1,11 @@
 import { CronJob } from 'cron';
-import { pingHeartBeat, collectWatchlistData } from '../interface.js';
+import { pingHeartBeat, collectData } from '../interface.js';
 
 
 new CronJob('*/5 * * * * *', async function () {
   try {
     await pingHeartBeat();
-    await collectWatchlistData();
+    await collectData();
   } catch (err) {
     console.log(err);
   }

@@ -1,0 +1,77 @@
+{
+  "local": {
+    "driver": "pg",
+    "host": {
+      "ENV": "PGHOST"
+    },
+    "port": {
+      "ENV": "PGPORT"
+    },
+    "user": {
+      "ENV": "PGUSER"
+    },
+    "password": {
+      "ENV": "PGPASSWORD"
+    }
+  },
+  "development": {
+    "driver": "pg",
+    "host": {
+      "ENV": "PGHOST"
+    },
+    "port": {
+      "ENV": "PGPORT"
+    },
+    "user": {
+      "ENV": "PGUSER"
+    },
+    "password": {
+      "ENV": "PGPASSWORD"
+    }
+  },
+  "test": {
+    "driver": "pg",
+    "host": {
+      "ENV": "PGHOST"
+    },
+    "port": {
+      "ENV": "PGPORT"
+    },
+    "user": {
+      "ENV": "PGUSER"
+    },
+    "password": {
+      "ENV": "PGPASSWORD"
+    }
+  },
+  "sandbox": {
+    "driver": "pg",
+    "host": {
+      "ENV": "PGHOST"
+    },
+    "port": {
+      "ENV": "PGPORT"
+    },
+    "user": {
+      "ENV": "PGUSER"
+    },
+    "password": {
+      "ENV": "PGPASSWORD"
+    }
+  },
+  "production": {
+    "driver": "pg",
+    "host": {
+      "ENV": "PGHOST"
+    },
+    "port": {
+      "ENV": "PGPORT"
+    },
+    "user": {
+      "ENV": "PGUSER"
+    },
+    "password": {
+      "ENV": "PGPASSWORD"
+    }
+  }
+}
