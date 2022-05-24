@@ -14,9 +14,9 @@ CREATE TABLE orders (
   id SERIAL PRIMARY KEY,
   uuid UUID NOT NULL,
   tradier_id varchar(32),
+  position_id INT,
   state orders_states NOT NULL,
-  contract varchar(64) NOT NULL,
-  strike varchar(16) NOT NULL,
+  contract_symbol varchar(64) NOT NULL,
   quantity INT NOT NULL,
   price FLOAT NOT NULL,
   type orders_types NOT NULL,
@@ -25,7 +25,7 @@ CREATE TABLE orders (
   updated_date timestamp
 );
 create index orders_state on orders (state);
-create index orders_contract on orders (contract);
+create index orders_contract_symbol on orders (contract_symbol);
 
 CREATE TRIGGER orders_status_update
   BEFORE UPDATE ON orders

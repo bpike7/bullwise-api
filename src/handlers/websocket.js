@@ -9,7 +9,7 @@ export default new class WS {
     const server = http.createServer(express);
     this.wss = new WebSocket.Server({ server });
     server.listen(PORT_WS, function () {
-      console.log(`Server is listening on ${PORT_WS}!`)
+      console.log(`Client facing WS listening on ${PORT_WS}!`)
     });
     this.wss.on("connection", ws => this.handleMessage(ws));
   }

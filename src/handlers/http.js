@@ -2,7 +2,8 @@ import express from 'express';
 import asyncHandler from 'express-async-handler';
 import {
   createBuyOrder,
-  getAllPositions,
+  createSellOrder,
+  getPositions,
   collectData,
 } from '../interface.js';
 
@@ -25,8 +26,13 @@ app.post('/create-buy-order', asyncHandler(async (req, res) => {
   res.send(data);
 }));
 
+app.post('/create-sell-order', asyncHandler(async (req, res) => {
+  const data = await createSellOrder(req.body);
+  res.send(data);
+}));
+
 app.post('/get-all-positions', asyncHandler(async (_, res) => {
-  const response = await getAllPositions();
+  const response = await getPositions();
   res.send(response);
 }));
 
