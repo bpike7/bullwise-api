@@ -17,6 +17,15 @@ let watchlistCache = [];
 const max = 500;
 const indexSymbols = ['QQQ', 'SPY', 'DIA'];
 
+
+// TODOS
+
+/*
+  - Make 'max' dynamic based on account size
+  - Make stop loss diff from price_avg dynamic based on that
+*/
+
+
 export async function collectData() {
   const symbols = await getSymbols();
   await updateQuoteCache(symbols);
@@ -175,7 +184,8 @@ export async function createBuyOrder({ symbol, option_type, strike, size_relativ
       )
       returning uuid
     `;
-    const order = await trading.createOrder({ symbol, option_symbol: option.symbol, side, quantity, type, tag: uuid });
+    ws.sendMessage(JSON.stringify({ notification: { message: 'Order created', color: 'white' } }));
+    const order = await trading.createOrder({ symbol, contract_symbol: option.symbol, side, quantity, type, tag: uuid });
     if (!order) return;
     await sql`
       update orders set 
@@ -219,13 +229,98 @@ export async function createSellOrder({ position_id, size_relative, buy_sell_poi
       )
       returning uuid
     `;
-    const order = await trading.createOrder({ symbol, option_symbol: position.contract_symbol, side, quantity, type, tag: uuid });
+    ws.sendMessage(JSON.stringify({ notification: { message: 'Order created', color: 'white' } }));
+    await cancelExistingStopOrders(position_id);
+    const order = await trading.createOrder({ symbol, contract_symbol: position.contract_symbol, side, quantity, type, tag: uuid });
     if (!order) return;
     await sql`
       update orders set 
         tradier_id = ${order.id.toString()}, 
         state='sent'
       where uuid = ${uuid}`;
+  } catch (err) {
+    console.log(err);
+  }
+}
+
+export async function cancelExistingStopOrders(position_id) {
+  const [order] = await sql`select tradier_id from orders where position_id = ${position_id} and type = 'stop'`;
+  const orderResponse = await trading.cancelOrder({ tradier_id: order.tradier_id });
+  if (orderResponse) await sql`
+    update orders set 
+      state='canceled'
+      where tradier_id = ${orderResponse.id.toString()}
+  `;
+}
+
+export async function createStopLossesOnNakedPositions() {
+  const positions = await sql` select * from positions where positions.state = 'open'`;
+  await Promise.all(positions.map(async p => {
+    const [existingStop] = await sql`select * from orders where position_id = ${p.id} and type = 'stop'`;
+    if (existingStop && existingStop.quantity === p.quantity) return;
+    else if (existingStop) {
+      // await(existingStop.id, { quantity: p.quantity });
+    }
+    else if (!existingStop) await createStopLossOrder(p.id);
+  }));
+}
+
+async function createStopLossOrder(position_id) {
+  const [position] = await sql`select * from positions where id = ${position_id} `;
+  const { symbol } = parseOptionSymbol(position.contract_symbol);
+  const side = 'sell_to_close';
+  const type = 'stop';
+  const quantity = position.quantity;
+  const price = Big(position.price_avg).minus(.3).toString();
+
+  try {
+    const uuid = v4uuid();
+    await sql`
+      insert into orders
+    (
+      uuid,
+      contract_symbol,
+      position_id,
+      state,
+      quantity,
+      price,
+      type,
+      side
+    ) VALUES
+      (
+        ${uuid},
+        ${position.contract_symbol},
+        ${position.id},
+        'accepted',
+        ${quantity},
+        ${price},
+        ${type},
+        ${side}
+      )
+      returning uuid
+    `;
+    const order = await trading.createOrder({
+      symbol,
+      contract_symbol: position.contract_symbol,
+      side,
+      quantity,
+      type,
+      tag: uuid,
+      stop: price
+    });
+    if (!order) return;
+    const [{ state }] = await sql`select state from orders where uuid = ${uuid}`;
+    if (state !== 'sent') return sql`
+      update orders set
+      tradier_id = ${order.id.toString()}
+      where uuid = ${uuid} 
+    `;
+    await sql`
+      update orders set
+      tradier_id = ${order.id.toString()},
+      state = 'sent'
+      where uuid = ${uuid} 
+    `;
   } catch (err) {
     console.log(err);
   }
@@ -267,6 +362,7 @@ async function getQuotes(symbols) {
       const fullOptionChain = await trading.getAllCloseOptions(q.symbol);
       const { calls, puts } = fullOptionChain.reduce((acc, o) => {
         const { option_type, strike, ask, bid } = o;
+        if (!ask || !bid) return acc;
         const bid_ask_spread = Big(ask).minus(bid).round(2).toNumber();
         if (ask * 100 > max) return acc;
         if (option_type === 'call') {
@@ -361,3 +457,32 @@ function percentGrowth(first, second) {
 function percentValue(value, percent) {
   return Big(value).times(percent).plus(value).toNumber();
 }
+
+
+// const uuid = await insertOrder({ contract_symbol: option.symbol, state: 'accepted', quantity, price, type, side });
+
+// async function insertOrder(p) {
+//   const [{ uuid }] = await sql`
+//   insert into orders 
+//   (
+//     uuid, 
+//     contract_symbol, 
+//     state, 
+//     quantity, 
+//     price, 
+//     type, 
+//     side
+//   ) VALUES
+//   (
+//     ${v4uuid()}, 
+//     ${p.contract_symbol}, 
+//     ${p.state}, 
+//     ${p.quantity}, 
+//     ${p.price}, 
+//     ${p.type}, 
+//     ${p.side}
+//   )
+//   returning uuid
+// `;
+//   return uuid;
+// }

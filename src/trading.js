@@ -6,7 +6,6 @@ import sql from './modules/db.js';
 import Big from 'big.js';
 import { getPositionsOrders } from './interface.js';
 import { parseOptionSymbol } from './modules/helpers.js';
-import { cursorPaginationEnabledMethods } from '@slack/web-api';
 
 const {
   TRADIER_BASE_URL,
@@ -43,6 +42,14 @@ const trading = new class Tradier {
         'Accept': 'application/json',
         'Content-Type': 'application/x-www-form-urlencoded'
       }
+    });
+  }
+
+  handleError(err) {
+    if (!err.response) return console.log(err);
+    return console.log({
+      status: err.response.status,
+      data: err.response.data
     });
   }
 
@@ -119,29 +126,35 @@ const trading = new class Tradier {
   }
 
   async createOrder(params) {
-    const { tag, symbol, option_symbol, quantity, type, order_price, side } = params;
+    const { tag, symbol, contract_symbol, quantity, type, order_price, side, stop } = params;
     try {
       const { data } = await this._requestor_qs.post(`/v1/accounts/${TRADIER_ACCOUNT_ID}/orders`, qs.stringify({
         tag,
         class: 'option',
         symbol,
-        option_symbol,
+        option_symbol: contract_symbol,
         side,
         quantity: quantity.toString(),
         type,
         duration: 'day',
-        price: order_price
+        price: order_price,
+        stop
       }));
-      console.log({ ...params, state: 'sent' });
-      if (!data.order || data.order.status !== 'ok') return console.log('Order faile: ', data);
+      if (!data.order || data.order.status !== 'ok') return console.log('Order failed: ', data);
       return data.order;
     } catch (err) {
-      console.log(err);
+      this.handleError(err);
     }
   }
 
-  async cancelOrder({ }) {
-
+  async cancelOrder({ tradier_id }) {
+    try {
+      console.log(`/v1/accounts/${TRADIER_ACCOUNT_ID}/orders/${tradier_id}`);
+      const { data } = await this._requestor.delete(`/v1/accounts/${TRADIER_ACCOUNT_ID}/orders/${tradier_id}`);
+      return data.order;
+    } catch (err) {
+      this.handleError(err);
+    }
   }
 
   async createAccountStream() {
@@ -174,8 +187,8 @@ export default trading;
 
 async function handleOrderMessage(data, attempt = 0) {
   try {
-    console.log('Tradier ws >> ', JSON.stringify({ id: data.id, uuid: data.tag, state: data.status }));
     const [existingOrder] = await sql`select * from orders where uuid = ${data.tag}`;
+    console.log('Tradier ws >> ', JSON.stringify({ type: data.type, state: data.status, symbol: existingOrder ? existingOrder.contract_symbol : undefined, tag: data.tag }));
     if (!existingOrder) {
       console.log('No existing order: ', attempt);
       if (attempt === 5) throw Error(`No existing order found for tag: ${JSON.stringify(data)}`);
@@ -186,15 +199,16 @@ async function handleOrderMessage(data, attempt = 0) {
     const [existingPosition] = await sql`select * from positions where contract_symbol = ${existingOrder.contract_symbol} and state = 'open'`;
 
     if (['pending', 'partially_filled', 'open', 'rejected', 'cancelled'].includes(data.status)) {
+      if (existingOrder.state === 'cancelled') return;
+      console.log(`${existingOrder.type} -> ${data.status}`);
       await sql`
-      update orders set
-      state = ${data.status}
-      where uuid = ${data.tag}
-    `;
+        update orders set
+        state = ${data.status}
+        where uuid = ${data.tag}
+      `;
     }
 
     if (['filled'].includes(data.status)) {
-      console.log('FILLED', existingOrder);
       const { symbol, strike } = parseOptionSymbol(existingOrder.contract_symbol);
       WSClient.sendMessage(JSON.stringify({
         notification: {
@@ -221,7 +235,6 @@ async function handleOrderMessage(data, attempt = 0) {
           where uuid = ${data.tag}
         `;
         } else {
-          console.log('New position');
           const [{ id }] = await sql`
             insert into positions
             (
@@ -239,7 +252,6 @@ async function handleOrderMessage(data, attempt = 0) {
               ${data.avg_fill_price}
               ) returning id
             `;
-          console.log('Inserted position');
           await sql`
             update orders set
             state = ${data.status},
@@ -247,7 +259,6 @@ async function handleOrderMessage(data, attempt = 0) {
             position_id = ${id}
             where uuid = ${data.tag}
           `;
-          console.log('inserted order');
         }
       }
 
@@ -268,135 +279,9 @@ async function handleOrderMessage(data, attempt = 0) {
       `;
       }
     }
-    console.log('sending new position');
     const positions = await getPositionsOrders();
     WSClient.sendMessage(JSON.stringify({ positions }));
   } catch (err) {
     console.log(err);
   }
 }
-
-// async function handleOrderMessage(data) {
-//   console.log('Tradier ws >> ', JSON.stringify({ id: data.id, uuid: data.tag, state: data.status }));
-//   try {
-//     const [existing] = await sql`select * from orders where uuid = ${data.tag}`;
-//     if (!existing) throw Error(`Unable to find order for ${data.id} ${data.tag}`);
-
-//     handleNotifications(existing, data);
-
-//     await sql`
-//       update orders set
-//       state = ${data.status},
-//       price = ${data.avg_fill_price}
-//       where uuid = ${data.tag}
-//     `;
-
-//     // link a filled status to a position or create a new position record
-//     if (data.status === 'filled') {
-//       console.log('Order status filled - creating position');
-//       const positions = await trading.getPositions();
-//       const match = positions.find(({ symbol }) => symbol === data.option_symbol);
-//       if (match) {
-//         // An existing position record may exist if this is a consecutive buy order, or any sell order 
-//         // These positions must be calculated cuz fuckin tradier didn't do shit for us
-//         const [existingPosition] = await sql`select * from positions where contract_symbol = ${data.option_symbol} and state = 'open'`;
-//         if (existingPosition) {
-//           const [existingOrder] = await sql`select contract_symbol from orders where uuid = ${data.tag}`;
-
-//           if (existingOrder && existingOrder.side === 'sell_to_close') {
-//             console.log('SELLING!!')
-//           } else {
-//             const addition = Big(data.avg_fill_price).times(data.exec_quantity);
-//             const sum = Big(existingPosition.price_avg).plus(addition);
-//             const newAvg = Big(sum).div(data.exec_quantity + 1).toNumber();
-//             await sql`
-//             update positions set
-//             price_avg = ${newAvg}
-//             quantity = ${data.exec_quantity + existingPosition.quantity}
-//             where id = ${existingPosition.id}
-//           `;
-//             await sql`
-//             update orders set
-//             price = ${data.avg_fill_price}
-//             position_id = ${existingPosition.id}
-//             where uuid = ${data.tag};
-//           `;
-//           }
-//         } else {
-//           const [order] = await sql`select contract_symbol from orders where uuid = ${data.tag}`;
-//           const [{ id }] = await sql`
-//             insert into positions
-//             (
-//               tradier_id,
-//               state,
-//               contract_symbol,
-//               quantity,
-//               price_avg
-//             ) VALUES
-//             (
-//               ${match.id}, 
-//               'open', 
-//               ${order.contract_symbol},
-//               ${data.exec_quantity},
-//               ${data.avg_fill_price}
-//             ) returning id
-//           `;
-//           await sql`
-//             update orders set
-//             position_id = ${id}
-//             where uuid = ${data.tag};
-//           `;
-//         }
-//       }
-//     }
-//     await sendFreshOrders();
-//   } catch (err) {
-//     console.log('Failed to handle order message: ', data, err);
-//   }
-// }
-
-// async function handleNotifications({ state: statePrev, contract_symbol, quantity }, { status: stateCurr, exec_quantity, remaining_quantity }) {
-//   if (statePrev === stateCurr) return;
-//   if (['partially_filled'].includes(stateCurr)) {
-//     WSClient.sendMessage(JSON.stringify({
-//       notification: {
-//         message: `Order partially filled: ${contract_symbol} (${exec_quantity}/${exec_quantity + remaining_quantity})`,
-//         color: 'white'
-//       }
-//     }));
-//   } else if (['pending'].includes(stateCurr) && statePrev !== 'pending') {
-//     WSClient.sendMessage(JSON.stringify({
-//       notification: {
-//         message: `Order placed: ${contract_symbol} x${quantity}`,
-//         color: 'white'
-//       }
-//     }));
-//   } else if (['open'].includes(stateCurr)) {
-//     WSClient.sendMessage(JSON.stringify({
-//       notification: {
-//         message: `Order placed: ${contract_symbol} x${quantity}`,
-//         color: 'white'
-//       }
-//     }));
-//   } else if (['filled'].includes(stateCurr)) {
-//     WSClient.sendMessage(JSON.stringify({
-//       notification: {
-//         message: `Order filled!: ${contract_symbol} x${quantity}`,
-//         color: 'green'
-//       }
-//     }));
-//   } else if (['rejected'].includes(stateCurr)) {
-//     WSClient.sendMessage(JSON.stringify({
-//       notification: {
-//         message: `Order rejected!`,
-//         color: 'red'
-//       }
-//     }));
-//   }
-// }
-
-// async function sendFreshOrders() {
-//   const positions = await getPositionsOrders();
-//   console.log(positions, ' >> Client WS');
-//   WSClient.sendMessage(JSON.stringify({ positions }));
-// }
