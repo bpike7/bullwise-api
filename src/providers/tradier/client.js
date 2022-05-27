@@ -1,11 +1,12 @@
 import axios from 'axios';
-import WSClient from './handlers/websocket.js';
+import WSClient from '../../handlers/websocket.js';
 import moment from 'moment-timezone';
 import qs from 'qs';
-import sql from './modules/db.js';
 import Big from 'big.js';
-import { getPositionsOrders } from './interface.js';
-import { parseOptionSymbol } from './modules/helpers.js';
+import { getPositionsOrders } from '../../interface.js';
+import { parseOptionSymbol } from '../../modules/helpers.js';
+import Orders from '../../orders.js';
+import Positions from '../../positions.js';
 
 const {
   TRADIER_BASE_URL,
@@ -19,7 +20,7 @@ const {
 const WebSocket = require('ws');
 
 
-const trading = new class Tradier {
+export default class Tradier {
   constructor() {
     this._requestor_production = axios.create({
       baseURL: TRADIER_BASE_URL_PRODUCTION,
@@ -102,29 +103,6 @@ const trading = new class Tradier {
     }
   }
 
-  async getPositions() {
-    try {
-      const { data } = await this._requestor.get(`v1/accounts/${TRADIER_ACCOUNT_ID}/positions`);
-      if (data.positions === 'null') return [];
-      if (data.positions.position instanceof Object) return [data.positions.position];
-      return data.positions.position;
-    } catch (err) {
-      console.log('Err: getPositions');
-      console.log(err);
-    }
-  };
-
-  async getActiveOrders() {
-    try {
-      const { data } = await this._requestor.get(`v1/accounts/${TRADIER_ACCOUNT_ID}/orders`);
-      if (data.orders === 'null') return [];
-      return data.orders.order.filter(({ status }) => ['open', 'partially_filled', 'pending'].includes(status));
-    } catch (err) {
-      console.log('Err: getOrders');
-      console.log(err);
-    }
-  }
-
   async createOrder(params) {
     const { tag, symbol, contract_symbol, quantity, type, order_price, side, stop } = params;
     try {
@@ -169,9 +147,10 @@ const trading = new class Tradier {
         }));
       });
       ws.on('message', function (dataRaw) {
+        console.log(this);
         const data = JSON.parse(dataRaw);
         if (data.event === 'heartbeat') return console.log('Tradier ws >> ok');
-        if (data.event === 'order') return handleOrderMessage(data);
+        if (data.event === 'order') return this.handleOrderMessage(data);
       });
       ws.on('error', function (data) {
         console.log(data);
@@ -181,107 +160,60 @@ const trading = new class Tradier {
       console.log('Err: createAccountStream');
     }
   }
-}
 
-export default trading;
+  async handleOrderMessage(data, attempt = 0) {
+    try {
+      const [existingOrder] = await Orders.get({ uuid: data.tag });
+      console.log('Tradier ws >> ', JSON.stringify({ type: data.type, state: data.status, symbol: existingOrder ? existingOrder.contract_symbol : undefined, tag: data.tag }));
+      if (!existingOrder) {
+        console.log('No existing order: ', attempt);
+        if (attempt === 5) throw Error(`No existing order found for tag: ${JSON.stringify(data)}`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        attempt += 1;
+        return handleOrderMessage(data, attempt);
+      }
+      const [existingPosition] = await Positions.get({ contract_symbol: existingOrder.contract_symbol, state: 'open' });
 
-async function handleOrderMessage(data, attempt = 0) {
-  try {
-    const [existingOrder] = await sql`select * from orders where uuid = ${data.tag}`;
-    console.log('Tradier ws >> ', JSON.stringify({ type: data.type, state: data.status, symbol: existingOrder ? existingOrder.contract_symbol : undefined, tag: data.tag }));
-    if (!existingOrder) {
-      console.log('No existing order: ', attempt);
-      if (attempt === 5) throw Error(`No existing order found for tag: ${JSON.stringify(data)}`);
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      attempt += 1;
-      return handleOrderMessage(data, attempt);
-    }
-    const [existingPosition] = await sql`select * from positions where contract_symbol = ${existingOrder.contract_symbol} and state = 'open'`;
-
-    if (['pending', 'partially_filled', 'open', 'rejected', 'cancelled'].includes(data.status)) {
-      if (existingOrder.state === 'cancelled') return;
-      console.log(`${existingOrder.type} -> ${data.status}`);
-      await sql`
-        update orders set
-        state = ${data.status}
-        where uuid = ${data.tag}
-      `;
-    }
-
-    if (['filled'].includes(data.status)) {
-      const { symbol, strike } = parseOptionSymbol(existingOrder.contract_symbol);
-      WSClient.sendMessage(JSON.stringify({
-        notification: {
-          message: `${existingOrder.side === 'buy_to_open' ? 'Bought' : 'Sold'} ${symbol} ${strike} x${data.exec_quantity}`,
-          color: 'green'
-        }
-      }));
-
-      if (existingOrder.side === 'buy_to_open') {
-        if (existingPosition) {
-          const addition = Big(data.avg_fill_price).times(data.exec_quantity);
-          const sum = Big(existingPosition.price_avg).plus(addition);
-          const newAvg = Big(sum).div(data.exec_quantity + 1).toNumber();
-          await sql`
-          update positions set
-          price_avg = ${newAvg},
-          quantity = ${data.exec_quantity + existingPosition.quantity}
-          where id = ${existingPosition.id}
-        `;
-          await sql`
-          update orders set
-          price = ${data.avg_fill_price},
-          position_id = ${existingPosition.id}
-          where uuid = ${data.tag}
-        `;
-        } else {
-          const [{ id }] = await sql`
-            insert into positions
-            (
-              tradier_id,
-              state,
-              contract_symbol,
-              quantity,
-              price_avg
-            ) VALUES
-            (
-              ${null}, 
-              'open', 
-              ${existingOrder.contract_symbol},
-              ${data.exec_quantity},
-              ${data.avg_fill_price}
-              ) returning id
-            `;
-          await sql`
-            update orders set
-            state = ${data.status},
-            price = ${data.avg_fill_price},
-            position_id = ${id}
-            where uuid = ${data.tag}
-          `;
-        }
+      if (['pending', 'partially_filled', 'open', 'rejected', 'cancelled'].includes(data.status)) {
+        if (existingOrder.state === 'cancelled') return;
+        await Orders.update({ uuid: data.tag, state: data.status });
       }
 
-      if (existingOrder.side === 'sell_to_close') {
-        const quantity = existingPosition.quantity - data.exec_quantity;
-        await sql`
-        update positions set
-        state = ${quantity > 0 ? 'open' : 'closed'},
-        quantity = ${quantity}
-        where id = ${existingPosition.id}
-      `;
-        await sql`
-        update orders set
-        state = ${data.status},
-        price = ${data.avg_fill_price},
-        position_id = ${existingPosition.id}
-        where uuid = ${data.tag}
-      `;
+      if (['filled'].includes(data.status)) {
+        const { symbol, strike } = parseOptionSymbol(existingOrder.contract_symbol);
+        WSClient.sendMessage(JSON.stringify({
+          notification: {
+            message: `${existingOrder.side === 'buy_to_open' ? 'Bought' : 'Sold'} ${symbol} ${strike} x${data.exec_quantity}`,
+            color: 'green'
+          }
+        }));
+
+        if (existingOrder.side === 'buy_to_open') {
+          if (existingPosition) {
+            const addition = Big(data.avg_fill_price).times(data.exec_quantity);
+            const sum = Big(existingPosition.price_avg).plus(addition);
+            const newAvg = Big(sum).div(data.exec_quantity + 1).toNumber();
+            await Positions.update({ id: existingPosition.id, price_avg: newAvg, quantity: data.exec_quantity + existingPosition.quantity });
+            await Orders.update({ uuid: data.tag, position_id: existingPosition.id, price: data.avg_fill_price });
+          } else {
+            const id = await Positions.insert({ state: 'open', contract_symbol: existingOrder.contract_symbol, quantity: data.exec_quantity, price_avg: data.avg_fill_price });
+            await Orders.update({ uuid: data.tag, position_id: id, state: data.status, price: data.avg_fill_price });
+          }
+        }
+
+        if (existingOrder.side === 'sell_to_close') {
+          const quantity = existingPosition.quantity - data.exec_quantity;
+          await Positions.update({ id: existingPosition.id, quantity, state: quantity > 0 ? 'open' : 'closed' });
+          await Orders.update({ uuid: data.tag, position_id: existingPosition.id, price: data.avg_fill_price, state: data.status });
+        }
       }
+      const positions = await getPositionsOrders();
+      WSClient.sendMessage(JSON.stringify({ positions }));
+    } catch (err) {
+      console.log(err);
     }
-    const positions = await getPositionsOrders();
-    WSClient.sendMessage(JSON.stringify({ positions }));
-  } catch (err) {
-    console.log(err);
   }
+
 }
+
+

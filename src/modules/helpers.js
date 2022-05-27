@@ -15,3 +15,7 @@ export function parseOptionSymbol(optionSymbol) {
     option_type: initial[initial.length - 1] === 'P' ? 'put' : 'call'
   }
 }
+
+export function hasAllKeyValuePairs(object, keysArray) {
+  return !Object.entries(object).some(([key, value]) => keysArray.includes(key) && !value);
+}

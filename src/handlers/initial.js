@@ -1,8 +1,8 @@
 import { collectData } from "../interface";
-import trading from '../trading.js';
+import tradier from '../providers/tradier/index.js';
 
 console.log('Cacheing initial data . . .');
-trading.createAccountStream();
+tradier.createAccountStream();
 
 collectData()
   .then(() => {

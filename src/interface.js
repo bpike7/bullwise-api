@@ -1,12 +1,12 @@
-import trading from './trading.js';
+import tradier from './providers/tradier/index.js';
 import axios from 'axios';
 import moment from 'moment-timezone';
 import { getSheetData, hubRangeMap } from './modules/googleSheets.js';
 import Big from 'big.js';
 import ws from './handlers/websocket.js';
-import sql from './modules/db.js';
-import { v4 as v4uuid } from 'uuid';
 import { parseOptionSymbol } from './modules/helpers.js';
+import Orders from './orders.js';
+import Positions from './positions.js';
 
 const { NODE_ENV, APP_URL, PORT, BULLWISE_SPREADSHEET_ID } = process.env;
 
@@ -34,10 +34,126 @@ export async function collectData() {
     watchlist: await updateWatchlist(symbols),
     positions: await getPositionsOrders(),
     orders: await getStrayOrders(),
-    account: await trading.getAccount()
+    account: await tradier.getAccount()
   };
   ws.sendMessage(JSON.stringify(data));
   return data;
+}
+
+export function getQuoteBySymbol(symbol) {
+  return quoteCache[symbol] || indexQuoteCache[symbol];
+}
+
+export async function getPositionsOrders() {
+  const positions = await Positions.get({ state: 'open' });
+  return Promise.all(positions.map(async p => {
+    const { symbol, strike, option_type } = parseOptionSymbol(p.contract_symbol);
+    const orders = await Orders.get({ position_id: p.id, state: ['pending', 'open', 'partially_filled'] });
+    return {
+      ...p,
+      symbol,
+      strike,
+      option_type,
+      orders
+    };
+  }));
+}
+
+export async function getPositions() {
+  const positions = await Positions.get({ state: 'open' });
+  return positions.map(p => {
+    const { symbol, strike, option_type } = parseOptionSymbol(p.contract_symbol);
+    return {
+      ...p,
+      symbol,
+      strike,
+      option_type
+    };
+  });
+}
+
+export async function getAccount() {
+  return {};
+}
+
+export async function pingHeartBeat() {
+  await axios.get(`${APP_URL}${NODE_ENV === 'development' ? `:${PORT}` : ''}/heartbeat`);
+}
+
+export async function createBuyOrder({ symbol, option_type, strike, size_relative, buy_sell_point }) {
+  const cachedQuote = quoteCache[symbol] || indexQuoteCache[symbol];
+  if (!cachedQuote) throw Error(`No cached quote found for ${symbol}`);
+  if (!['call', 'put'].includes(option_type)) throw Error('Invalid option type supplied');
+  const option = cachedQuote[`${option_type}s`].find((o) => o.strike === strike);
+  if (!option) throw Error(`No option found for strike ${option_type} ${strike}`);
+  const side = 'buy_to_open';
+  const type = 'market'; // CURRENTLY ONLY SUPPORTING MARKET ORDERS!!!
+  const price = buy_sell_point === 'bid-ask' ? option.ask : Big(option.ask).plus(option.bid).div(2).toNumber();
+  const cost = Big(price).times(100).toNumber();
+  const quantity = Big(max).div(cost).round().toNumber();
+  try {
+    const uuid = await Orders.insert({ contract_symbol: option.symbol, state: 'accepted', quantity, type, side, price: 0.00 });
+    ws.sendMessage(JSON.stringify({ notification: { message: 'Order created', color: 'white' } }));
+    const order = await tradier.createOrder({ symbol, contract_symbol: option.symbol, side, quantity, type, tag: uuid });
+    if (!order) return;
+    await Orders.update({ uuid, tradier_id: order.id.toString() });
+  } catch (err) {
+    console.log(err);
+  }
+}
+
+export async function createSellOrder({ position_id, size_relative, buy_sell_point }) {
+  const [position] = await Positions.get({ id: position_id });
+  const { symbol } = parseOptionSymbol(position.contract_symbol);
+  const side = 'sell_to_close';
+  const type = 'market';
+  const quantity = position.quantity;
+  try {
+    const uuid = await Orders.insert({ contract_symbol: position.contract_symbol, state: 'accepted', quantity, price: 0.00, type, side });
+    ws.sendMessage(JSON.stringify({ notification: { message: 'Order created', color: 'white' } }));
+    await cancelExistingStopOrders(position_id);
+    const order = await tradier.createOrder({ symbol, contract_symbol: position.contract_symbol, side, quantity, type, tag: uuid });
+    if (!order) return;
+    await Orders.update({ uuid, tradier_id: order.id.toString(), state: 'sent' });
+  } catch (err) {
+    console.log(err);
+  }
+}
+
+export async function createStopLossesOnNakedPositions() {
+  const positions = await Positions.get({ state: 'open' });
+  await Promise.all(positions.map(async p => {
+    const [existingStop] = await Orders.get({ position_id: p.id, type: 'stop' });
+    if (existingStop && existingStop.quantity === p.quantity) return;
+    else if (existingStop) {
+      // await(existingStop.id, { quantity: p.quantity });
+    }
+    else if (!existingStop) await createStopLossOrder(p.id);
+  }));
+}
+
+async function getStrayOrders() {
+  const orders = await Orders.get({ state: ['pending', 'open', 'partially_filled'], position_id: 'IS NULL' });
+  return orders.map(o => {
+    const { symbol, strike, option_type } = parseOptionSymbol(o.contract_symbol);
+    return {
+      ...o,
+      symbol,
+      strike,
+      option_type
+    };
+  })
+}
+
+function getIndexLevelData() {
+  const indices = indexSymbols.map(symbol => ({ symbol, ...(indexQuoteCache[symbol] || {}) }));
+  return indices.map(createClientView)
+}
+
+async function cancelExistingStopOrders(position_id) {
+  const [order] = await Orders.get({ position_id, type: 'stop' });
+  const orderResponse = await tradier.cancelOrder({ tradier_id: order.tradier_id });
+  if (orderResponse) await Orders.update({ id: order.id, state: 'canceled' });
 }
 
 async function updateQuoteCache(symbols) {
@@ -57,7 +173,6 @@ async function updateWatchlist(symbols) {
   return watchlistCache.map(createClientView)
 }
 
-const keys = ['open', 'prevclose', 'high', 'low', 'close'];
 function createClientView(wl) {
   // Derive strike min, max, closest
   const { strike_min, strike_max, strike_close } = [...wl.calls, ...wl.puts].reduce((acc, { strike }) => {
@@ -68,7 +183,7 @@ function createClientView(wl) {
   }, { strike_min: 100000, strike_max: 0, strike_close: 0 });
   // Append key levels and distance from current price
   const key_levels = { above: [], below: [] };
-  keys.forEach(key => {
+  ['open', 'prevclose', 'high', 'low', 'close'].forEach(key => {
     const percent_from = percentGrowth(wl.price_now, wl[key]);
     if (percent_from >= 0) key_levels.above.push({ type: key, percent_from });
     else key_levels.below.push({ type: key, percent_from });
@@ -89,217 +204,16 @@ function createClientView(wl) {
   }
 }
 
-export async function getPositionsOrders() {
-  const positions = await sql`select * from positions where state = 'open'`;
-  return Promise.all(positions.map(async p => {
-    const { symbol, strike, option_type } = parseOptionSymbol(p.contract_symbol);
-    const orders = await sql`select * from orders where position_id=${p.id} and state in ('pending', 'open', 'partially_filled')`;
-    return {
-      ...p,
-      symbol,
-      strike,
-      option_type,
-      orders
-    };
-  }));
-}
-
-export async function getPositions() {
-  const positions = await sql`select * from positions where state = 'open'`;
-  return positions.map(p => {
-    const { symbol, strike, option_type } = parseOptionSymbol(p.contract_symbol);
-    return {
-      ...p,
-      symbol,
-      strike,
-      option_type
-    };
-  });
-}
-
-export async function getStrayOrders() {
-  const orders = await sql`
-    select * from orders
-    where state in ('pending', 'open', 'partially_filled')
-    and position_id IS NULL
-  `;
-  return orders.map(o => {
-    const { symbol, strike, option_type } = parseOptionSymbol(o.contract_symbol);
-    return {
-      ...o,
-      symbol,
-      strike,
-      option_type
-    };
-  })
-}
-
-export function getIndexLevelData() {
-  const indices = indexSymbols.map(symbol => ({ symbol, ...(indexQuoteCache[symbol] || {}) }));
-  return indices.map(createClientView)
-}
-
-export async function getAccount() {
-  return {};
-}
-
-export async function pingHeartBeat() {
-  await axios.get(`${APP_URL}${NODE_ENV === 'development' ? `:${PORT}` : ''}/heartbeat`);
-}
-
-export async function createBuyOrder({ symbol, option_type, strike, size_relative, buy_sell_point }) {
-  const cachedQuote = quoteCache[symbol] || indexQuoteCache[symbol];
-  if (!cachedQuote) throw Error(`No cached quote found for ${symbol}`);
-  if (!['call', 'put'].includes(option_type)) throw Error('Invalid option type supplied');
-
-  const option = cachedQuote[`${option_type}s`].find((o) => o.strike === strike);
-  if (!option) throw Error(`No option found for strike ${option_type} ${strike}`);
-
-  const side = 'buy_to_open';
-  const type = 'market';
-  const price = buy_sell_point === 'bid-ask' ? option.ask : Big(option.ask).plus(option.bid).div(2).toNumber();
-  const cost = Big(price).times(100).toNumber();
-  const quantity = Big(max).div(cost).round().toNumber();
-
-  try {
-    const [{ uuid }] = await sql`
-      insert into orders 
-      (
-        uuid, 
-        contract_symbol, 
-        state, 
-        quantity, 
-        price, 
-        type, 
-        side
-      ) VALUES
-      (
-        ${v4uuid()}, 
-        ${option.symbol}, 
-        'accepted', 
-        ${quantity}, 
-        ${price}, 
-        ${type}, 
-        ${side}
-      )
-      returning uuid
-    `;
-    ws.sendMessage(JSON.stringify({ notification: { message: 'Order created', color: 'white' } }));
-    const order = await trading.createOrder({ symbol, contract_symbol: option.symbol, side, quantity, type, tag: uuid });
-    if (!order) return;
-    await sql`
-      update orders set 
-        tradier_id = ${order.id.toString()}, 
-        state='sent'
-      where uuid = ${uuid}`;
-  } catch (err) {
-    console.log(err);
-  }
-}
-
-export async function createSellOrder({ position_id, size_relative, buy_sell_point }) {
-  const [position] = await sql`select * from positions where id = ${position_id}`;
-
-  const { symbol } = parseOptionSymbol(position.contract_symbol);
-
-  const side = 'sell_to_close';
-  const type = 'market';
-  const quantity = position.quantity;
-
-  try {
-    const [{ uuid }] = await sql`
-      insert into orders 
-      (
-        uuid, 
-        contract_symbol, 
-        state, 
-        quantity, 
-        price, 
-        type, 
-        side
-      ) VALUES
-      (
-        ${v4uuid()}, 
-        ${position.contract_symbol}, 
-        'accepted', 
-        ${quantity}, 
-        ${0.00},
-        ${type},
-        ${side}
-      )
-      returning uuid
-    `;
-    ws.sendMessage(JSON.stringify({ notification: { message: 'Order created', color: 'white' } }));
-    await cancelExistingStopOrders(position_id);
-    const order = await trading.createOrder({ symbol, contract_symbol: position.contract_symbol, side, quantity, type, tag: uuid });
-    if (!order) return;
-    await sql`
-      update orders set 
-        tradier_id = ${order.id.toString()}, 
-        state='sent'
-      where uuid = ${uuid}`;
-  } catch (err) {
-    console.log(err);
-  }
-}
-
-export async function cancelExistingStopOrders(position_id) {
-  const [order] = await sql`select tradier_id from orders where position_id = ${position_id} and type = 'stop'`;
-  const orderResponse = await trading.cancelOrder({ tradier_id: order.tradier_id });
-  if (orderResponse) await sql`
-    update orders set 
-      state='canceled'
-      where tradier_id = ${orderResponse.id.toString()}
-  `;
-}
-
-export async function createStopLossesOnNakedPositions() {
-  const positions = await sql` select * from positions where positions.state = 'open'`;
-  await Promise.all(positions.map(async p => {
-    const [existingStop] = await sql`select * from orders where position_id = ${p.id} and type = 'stop'`;
-    if (existingStop && existingStop.quantity === p.quantity) return;
-    else if (existingStop) {
-      // await(existingStop.id, { quantity: p.quantity });
-    }
-    else if (!existingStop) await createStopLossOrder(p.id);
-  }));
-}
-
 async function createStopLossOrder(position_id) {
-  const [position] = await sql`select * from positions where id = ${position_id} `;
+  const [position] = await Positions.get({ id: position_id });
   const { symbol } = parseOptionSymbol(position.contract_symbol);
   const side = 'sell_to_close';
   const type = 'stop';
   const quantity = position.quantity;
   const price = Big(position.price_avg).minus(.3).toString();
-
   try {
-    const uuid = v4uuid();
-    await sql`
-      insert into orders
-    (
-      uuid,
-      contract_symbol,
-      position_id,
-      state,
-      quantity,
-      price,
-      type,
-      side
-    ) VALUES
-      (
-        ${uuid},
-        ${position.contract_symbol},
-        ${position.id},
-        'accepted',
-        ${quantity},
-        ${price},
-        ${type},
-        ${side}
-      )
-      returning uuid
-    `;
-    const order = await trading.createOrder({
+    const uuid = await Orders.insert({ contract_symbol: position.contract_symbol, position_id: position.id, state: 'accepted', quantity, price, type, side });
+    const order = await tradier.createOrder({
       symbol,
       contract_symbol: position.contract_symbol,
       side,
@@ -309,18 +223,9 @@ async function createStopLossOrder(position_id) {
       stop: price
     });
     if (!order) return;
-    const [{ state }] = await sql`select state from orders where uuid = ${uuid}`;
-    if (state !== 'sent') return sql`
-      update orders set
-      tradier_id = ${order.id.toString()}
-      where uuid = ${uuid} 
-    `;
-    await sql`
-      update orders set
-      tradier_id = ${order.id.toString()},
-      state = 'sent'
-      where uuid = ${uuid} 
-    `;
+    const [{ state }] = await Orders.get({ uuid });
+    if (state !== 'sent') return Orders.update({ uuid, tradier_id: order.id.toString() });
+    await Orders.update({ uuid, tradier: order.id.toString(), state: 'sent' });
   } catch (err) {
     console.log(err);
   }
@@ -332,7 +237,7 @@ async function getSymbols() {
 
 async function getQuotes(symbols) {
   try {
-    const quoteData = await trading.getAllQuotes(symbols);
+    const quoteData = await tradier.getAllQuotes(symbols);
     const quoteResponse = (quoteData instanceof Array ? quoteData : [quoteData]).filter(q => !!q);
     return Promise.all(quoteResponse.map(async q => {
       const cachedQuote = quoteCache[q.symbol] || indexQuoteCache[q.symbol] || {};
@@ -359,7 +264,7 @@ async function getQuotes(symbols) {
       // Append options
       const upperRealisticRange = percentValue(q.last, .1);
       const lowerRealisticRange = percentValue(q.last, -.1);
-      const fullOptionChain = await trading.getAllCloseOptions(q.symbol);
+      const fullOptionChain = await tradier.getAllCloseOptions(q.symbol);
       const { calls, puts } = fullOptionChain.reduce((acc, o) => {
         const { option_type, strike, ask, bid } = o;
         if (!ask || !bid) return acc;
@@ -415,7 +320,7 @@ async function getQuotes(symbols) {
 
 async function getDailyCandles(s) {
   try {
-    const data = await trading.getDailyCandles(s);
+    const data = await tradier.getDailyCandles(s);
     if (!data || !data.history || !data.history.day) return null;
     return JSON.stringify(data.history.day.reverse());
   } catch (e) {
@@ -457,32 +362,3 @@ function percentGrowth(first, second) {
 function percentValue(value, percent) {
   return Big(value).times(percent).plus(value).toNumber();
 }
-
-
-// const uuid = await insertOrder({ contract_symbol: option.symbol, state: 'accepted', quantity, price, type, side });
-
-// async function insertOrder(p) {
-//   const [{ uuid }] = await sql`
-//   insert into orders 
-//   (
-//     uuid, 
-//     contract_symbol, 
-//     state, 
-//     quantity, 
-//     price, 
-//     type, 
-//     side
-//   ) VALUES
-//   (
-//     ${v4uuid()}, 
-//     ${p.contract_symbol}, 
-//     ${p.state}, 
-//     ${p.quantity}, 
-//     ${p.price}, 
-//     ${p.type}, 
-//     ${p.side}
-//   )
-//   returning uuid
-// `;
-//   return uuid;
-// }
